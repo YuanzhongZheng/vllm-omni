@@ -516,7 +516,7 @@ def parse_args():
     )
 
     # Required
-    p.add_argument("--audio-dir", required=True,
+    p.add_argument("--audio-dir", required=True, default="/data4/zhengyuanzhong/audios_sample",
                    help="Directory of audio files (scanned recursively)")
 
     # Mode
@@ -525,34 +525,34 @@ def parse_args():
                         "full=both  (default: quick)")
 
     # Model
-    p.add_argument("--model", default="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    p.add_argument("--model", default="/data4/zhengyuanzhong/Qwen3-Omni-model/Qwen3-Omni-30B-A3B-Instruct",
                    help="HF model name or local path")
     p.add_argument("--dtype", default="auto")
     p.add_argument("--stage-configs-path", default=None,
                    help="vllm-omni stage config YAML (optional)")
 
     # quick options
-    p.add_argument("--files", type=int, default=10,
+    p.add_argument("--files", type=int, default=50,
                    help="[quick/full] Number of unique audio files (default: 10)")
-    p.add_argument("--runs", type=int, default=3,
+    p.add_argument("--runs", type=int, default=7,
                    help="[quick/full] Repeated runs per file for latency stats (default: 3)")
 
     # sweep options
     p.add_argument("--batch-sizes", nargs="+", type=int,
-                   default=[1, 2, 4, 8, 16, 32],
-                   help="[sweep/full] Batch sizes to try (stops on OOM, default: 1 2 4 8 16 32)")
-    p.add_argument("--sweep-runs", type=int, default=3,
+                   default=[1, 2, 4, 8, 16, 24, 32],
+                   help="[sweep/full] Batch sizes to try (stops on OOM, default: 1 2 4 8 16 24 32)")
+    p.add_argument("--sweep-runs", type=int, default=7,
                    help="[sweep/full] Rounds per batch size (default: 3)")
 
     # common
     p.add_argument("--max-new-tokens", type=int, default=2048)
-    p.add_argument("--gpu", type=str, default=None,
+    p.add_argument("--gpu", type=str, default='1',
                    help="CUDA device(s), e.g. '0' or '0,1'")
     p.add_argument("--log-stats", action="store_true", default=False)
 
     # engine timeouts (same as annotate_audio.py / end2end.py)
     p.add_argument("--stage-init-timeout", type=int, default=300)
-    p.add_argument("--batch-timeout", type=int, default=5)
+    p.add_argument("--batch-timeout", type=int, default=10)
     p.add_argument("--init-timeout", type=int, default=300)
     p.add_argument("--shm-threshold-bytes", type=int, default=65536)
 
