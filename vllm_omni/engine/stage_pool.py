@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
@@ -22,6 +23,7 @@ from vllm_omni.engine.stage_client import (
     StagePoolDiffusionClient,
     StagePoolLLMClient,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
@@ -301,6 +303,51 @@ class StagePool:
                 raise RuntimeError(f"no UP replica for stage {self.stage_id} after {self.DISPATCH_WAIT_TIMEOUT_S:.1f}s")
             await asyncio.sleep(min(self.DISPATCH_RETRY_INTERVAL_S, deadline - now))
 
+    def preselect_replica_id(
+        self,
+        request_id: str,
+        task: Task | None = None,
+        *,
+        affinity_request_id: str | None = None,
+    ) -> int | None:
+        """Synchronously pick and bind a replica before request preprocessing.
+
+        The main-thread input preprocessing path cannot await :meth:`pick`, but
+        multimodal cache UUID scoping needs to know the same replica that
+        :meth:`submit_initial` will later use. In distributed mode this checks
+        the hub's cached replica snapshot once and records the selected input
+        address in ``_affinity`` so the async submit path reuses the route. If
+        no replica is currently serviceable, return ``None`` and let the async
+        submit-time router wait without blocking the caller.
+        """
+        if self._hub is None or self._lb is None:
+            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+
+        bound_addr = self._affinity.get(request_id)
+        if bound_addr is not None:
+            replica_id = self._serviceable_replica_id_for_addr(bound_addr)
+            if replica_id is not None:
+                return replica_id
+            self._affinity.pop(request_id, None)
+
+        if affinity_request_id is not None:
+            parent_addr = self._affinity.get(affinity_request_id)
+            if parent_addr is not None:
+                replica_id = self._serviceable_replica_id_for_addr(parent_addr)
+                if replica_id is not None:
+                    self._affinity[request_id] = parent_addr
+                    return replica_id
+
+        task = task or Task(request_id=request_id)
+        candidates = self._collect_serviceable_replicas()
+        if not candidates:
+            return None
+
+        lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
+        replica_info, replica_id = candidates[lb_idx]
+        self._affinity[request_id] = replica_info.input_addr
+        return replica_id
+
     def _collect_serviceable_replicas(self) -> list[tuple[ReplicaInfo, int]]:
         """Return list of ``(ReplicaInfo, replica_id)`` for UP, attached replicas."""
         if self._hub is None:
@@ -464,6 +511,7 @@ class StagePool:
             stage_gen_time_ms=stage_gen_time_ms,
             batch_id=batch_id,
             batch_size=1,
+            replica_id=replica_id,
             rx_decode_time_ms=0.0,
             rx_transfer_bytes=0,
             rx_in_flight_time_ms=0.0,
@@ -488,6 +536,10 @@ class StagePool:
     ) -> int:
         """Submit a stage-entry request into this pool."""
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
+        # Convert plain vllm SamplingParams for single-stage diffusion models
+        # that receive sampling params from the user/caller directly.
+        if self.stage_type == "diffusion" and not isinstance(params, OmniDiffusionSamplingParams):
+            params = OmniDiffusionSamplingParams()
         submit_kwargs = dict(submit_kwargs or {})
         if self.stage_type == "diffusion":
             replica_id = await self._pick_or_select(
@@ -548,6 +600,8 @@ class StagePool:
     ) -> int:
         """Submit a streaming update to an already admitted request."""
         params = req_state.sampling_params_list[self.stage_id]
+        if self.stage_type == "diffusion" and not isinstance(params, OmniDiffusionSamplingParams):
+            params = OmniDiffusionSamplingParams()
         replica_id = self.get_bound_replica_id(request_id)
         if replica_id is None or self.clients[replica_id] is None:
             replica_id = await self._pick_or_select(request_id)
@@ -596,6 +650,7 @@ class StagePool:
         self,
         replica_id: int,
         raw_outputs: EngineCoreOutputs,
+        iteration_stats: IterationStats | None = None,
     ) -> list[Any]:
         """Run the shared LLM output processor on one raw poll result."""
         raw_client = self.clients[replica_id]
@@ -606,7 +661,7 @@ class StagePool:
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
-            None,
+            iteration_stats,
         )
 
         if processed.reqs_to_abort:
