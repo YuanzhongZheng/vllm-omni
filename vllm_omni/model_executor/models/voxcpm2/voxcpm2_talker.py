@@ -234,9 +234,13 @@ def build_voxcpm2_prompt(
                 prefill_len += len(prompt_ids)
             prefill_len += audio_feat_len
     elif ref_audio is not None:
+        use_ecapa = getattr(hf_config, "use_ecapa_ref_prefix", False)
         vae = hf_config.audio_vae_config
-        patch_samples = hf_config.patch_size * math.prod(vae["encoder_rates"])
-        ref_len = math.ceil(math.ceil(len(ref_audio) * vae["sample_rate"] / ref_sr) / patch_samples)
+        if use_ecapa:
+            ref_len = 1
+        else:
+            patch_samples = hf_config.patch_size * math.prod(vae["encoder_rates"])
+            ref_len = math.ceil(math.ceil(len(ref_audio) * vae["sample_rate"] / ref_sr) / patch_samples)
         if ref_text is not None:
             additional["prompt_audio"] = [[ref_audio, ref_sr]]
             additional["prompt_text"] = [ref_text]
@@ -262,7 +266,32 @@ def _encode_raw_audio(
 
     Mirrors ``VoxCPM2Model._encode_wav`` but accepts in-memory samples
     instead of a file path (needed for the OpenAI speech API).
+
+    For B2-F checkpoints (``use_ecapa_ref_prefix=True``), reference audio is
+    encoded by ECAPA-TDNN + the learned ``spk_to_feat`` projector instead of
+    the AudioVAE.
     """
+    use_ecapa = getattr(tts.config, "use_ecapa_ref_prefix", False) and tts.spk_to_feat is not None
+    if use_ecapa and padding_mode == "right":
+        # Reference path: use the model's built-in ECAPA extractor.
+        if isinstance(samples, list):
+            samples = torch.tensor(samples, dtype=torch.float32)
+        else:
+            samples = samples.float()
+        if samples.ndim == 1:
+            samples = samples.unsqueeze(0)
+        # The model's ECAPA extractor expects a file path; write a temporary WAV.
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            import soundfile as sf
+            sf.write(tmp_path, samples.squeeze(0).numpy(), sr)
+            return tts._encode_wav(tmp_path, padding_mode="right", trim_silence_vad=False)
+        finally:
+            import os
+            os.unlink(tmp_path)
+
     if isinstance(samples, list):
         audio = torch.tensor(samples, dtype=torch.float32)
     else:
@@ -1738,6 +1767,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         tts_len = text_mask.shape[1]
         scaffold_len = base_lm_out.shape[0]
+        if scaffold_len > tts_len:
+            # Bucket-padded batches: the caller padded prompt_token_ids to the
+            # bucket max-length, so base_lm_out has extra trailing positions that
+            # correspond to dummy [1] tokens.  Discard them before TTS processing.
+            base_lm_out = base_lm_out[:tts_len]
+            scaffold_len = tts_len
         assert scaffold_len == tts_len, (
             f"voxcpm2 prefill length mismatch: scaffold_len={scaffold_len} tts_len={tts_len}; "
             "caller must pad prompt_token_ids to the full prefill length "
